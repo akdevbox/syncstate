@@ -1,0 +1,21 @@
+[ req ]
+distinguished_name = req_distinguished_name
+x509_extensions = v3_ca
+prompt = no
+
+[ req_distinguished_name ]
+# Common Name (CN) is what you type for the domain name
+CN = localhost
+
+[ v3_ca ]
+# Standard V3 extensions required by rustls and modern clients
+basicConstraints = CA:false
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+# Subject Alternative Name (SAN) is required by modern browsers/clients
+subjectAltName = @alt_names
+
+[ alt_names ]
+# IMPORTANT: Include both DNS name and IP address for local testing
+DNS.1 = localhost
+DNS.2 = 127.0.0.1
+IP.1 = 127.0.0.1
