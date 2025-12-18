@@ -61,4 +61,7 @@ pub enum TcpStateServerResponse {
         /// The encoded diff is serialized form of Vec<(K, T)>
         encoded_diff: Vec<u8>,
     },
+    InitFailure {
+        error_message: String,
+    },
 }

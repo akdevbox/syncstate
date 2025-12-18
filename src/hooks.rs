@@ -5,7 +5,10 @@ use crate::{
     event::EventType,
     statemap::{StateMapKey, StateMapValue},
 };
-use std::{error::Error, sync::Mutex};
+use std::{
+    error::Error,
+    sync::{Arc, Mutex},
+};
 
 /// Hooks are user defined functions that recieve a [`Mutex`] over the centralized
 /// [`StateMap`]. Events are of different types are called by different sorts
@@ -20,4 +23,13 @@ pub trait Hook<K: StateMapKey, T: StateMapValue, E: EventType>: Send + Sync {
         state: &Mutex<StateMap<K, T>>,
         event: &Event<E>,
     ) -> Result<(), Box<dyn Error>>;
+}
+
+/// Init hooks are user defined functions similar to [`Hook`], except that they
+/// are not run on Events but they run when the [`StateMap`] is initialized in a server
+/// implementation. These run only once and any long running tasks should spawn a thread.
+/// If any errors are returned by these, the state map does not get created on the server
+/// and instead the implementation should return a response indicating error.
+pub trait InitHook<K: StateMapKey, T: StateMapValue>: Send + Sync {
+    fn process_init(&self, state: Arc<Mutex<StateMap<K, T>>>) -> Result<(), Box<dyn Error>>;
 }

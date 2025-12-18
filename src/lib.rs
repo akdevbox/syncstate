@@ -67,7 +67,7 @@
 //! use syncstate::*;
 //! use serde::{Serialize, Deserialize};
 //!
-//! use std::{sync::{Mutex, Arc}, error::Error, net::TcpListener, fmt::{self, Debug, Display}, time::Duration, thread::sleep};
+//! use std::{sync::{Mutex, Arc}, error::Error, net::TcpListener, fmt::{self, Debug, Display}, time::Duration, thread::{sleep, spawn}};
 //!
 //! type MyMapKey = String;  // For this example, we will use String for key and value, it implements all the traits that we need
 //! type MyMapValue = String;
@@ -104,6 +104,23 @@
 //!     }
 //! }
 //!
+//! struct MyInitHook;
+//! impl InitHook<MyMapKey, MyMapValue> for MyInitHook {
+//!     fn process_init(&self, state: Arc<Mutex<StateMap<MyMapKey, MyMapValue>>>) -> Result<(), Box<dyn Error>> {
+//!         println!("You can run any initialization tasks on the state here, init hooks are run sequentially similar to normal hooks");
+//!
+//!         // For any long running tasks, just spawn a thread
+//!         spawn(move || {
+//!             if let Ok(state_lock) = state.lock() {
+//!                 println!("StateMap: {state_lock:#?}");
+//!             }
+//!             sleep(Duration::from_millis(2500));
+//!         });
+//!
+//!         Ok(())
+//!     }
+//! }
+//!
 //! fn server() {
 //!     let listner = TcpListener::bind("127.0.0.1:12345").unwrap();
 //!
@@ -121,8 +138,10 @@
 //!     
 //!     // Hooks can only be set once
 //!     let hooks: Arc<Vec<Box<dyn Hook<MyMapKey, MyMapValue, MyEvent>>>> = Arc::new(vec![Box::new(MyHook)]);
+//!     let init_hooks: Arc<Vec<Box<dyn InitHook<MyMapKey, MyMapValue>>>> = Arc::new(vec![Box::new(MyInitHook)]);
 //!
 //!     let mut state_server: tcp::TcpStateServer<MyMapKey, MyMapValue, MyEvent> = tcp::TcpStateServer::from_tcp_listner(listner, tls_config, hooks, password);
+//!     state_server.set_init_hooks(init_hooks);
 //!     
 //!     // Loop
 //!     loop {
@@ -204,4 +223,4 @@ pub use remote::{DummyRemote, EventBroadcaster, Remote};
 pub use diff::Diff;
 
 #[doc(inline)]
-pub use hooks::Hook;
+pub use hooks::{Hook, InitHook};

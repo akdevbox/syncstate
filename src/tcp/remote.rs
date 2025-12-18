@@ -69,8 +69,8 @@ impl TcpStateRemote {
         };
 
         let req_buffer = bincode::serde::encode_to_vec(wrapper, bincode::config::standard())?;
-        stream.write(&(req_buffer.len() as u32).to_be_bytes())?;
-        stream.write(&req_buffer)?;
+        let _ = stream.write(&(req_buffer.len() as u32).to_be_bytes())?;
+        let _ = stream.write(&req_buffer)?;
 
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf)?;
@@ -125,11 +125,11 @@ impl<K: StateMapKey, T: StateMapValue> Remote<K, T> for TcpStateRemote {
             .expect("Expected the statemap to be frozen before init was called on remote")
             .to_owned();
 
-        let resp = self.send_request(TcpStateServerRequest::GetUpdateId { hash: hash.clone() })?;
+        let resp = self.send_request(TcpStateServerRequest::GetUpdateId { hash })?;
 
         if let TcpStateServerResponse::HashNotFound = &resp {
             let init_resp = self.send_request(TcpStateServerRequest::Init {
-                hash: hash.clone(),
+                hash,
                 init_data: bincode::serde::encode_to_vec(
                     statemap
                         .into_iter()

@@ -203,9 +203,9 @@ impl<K: StateMapKey, T: StateMapValue> StateMap<K, T> {
             let bytelen_key = (x.as_ref().len() as u64).to_be_bytes();
             let bytelen_data = (v.as_ref().len() as u64).to_be_bytes();
 
-            hasher.update(&bytelen_key);
+            hasher.update(bytelen_key);
             hasher.update(x);
-            hasher.update(&bytelen_data);
+            hasher.update(bytelen_data);
             hasher.update(v);
         }
 
@@ -220,7 +220,7 @@ impl<K: StateMapKey, T: StateMapValue> StateMap<K, T> {
     /// this `StateMap` will sync with. Calling this method initiates [`Remote::init`] method
     /// so it might make network calls.
     pub fn freeze(&mut self) -> Result<(), StateMapError> {
-        if !self.hash.is_some() {
+        if self.hash.is_none() {
             self.hash = Some(self.calculate_hash());
             self.diffs.push_back(Diff::full_diff(self));
             self.remote.init(self)?;
@@ -445,7 +445,7 @@ where
         f.debug_struct("StateMap")
             .field("data", &self.data)
             .field("update_id", &self.update_id)
-            .field("hash", &self.hash.as_ref().map(|x| hex::encode(x)))
+            .field("hash", &self.hash.as_ref().map(hex::encode))
             .field("is_master", &self.is_master)
             .field("diffs", &self.diffs)
             .finish()

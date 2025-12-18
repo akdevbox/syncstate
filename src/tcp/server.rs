@@ -10,7 +10,7 @@ use std::{
 use tracing::{error, info};
 
 use crate::{
-    DummyRemote, Event, Hook, StateMap, StateMapError,
+    DummyRemote, Event, Hook, InitHook, StateMap, StateMapError,
     event::EventType,
     statemap::{StateMapKey, StateMapValue},
     tcp::TcpStateServerResponse,
@@ -48,6 +48,7 @@ fn to_unknown_err<T: ToString>(v: T) -> TcpStateServerError {
 }
 
 pub type HooksVec<K, T, E> = Arc<Vec<Box<dyn Hook<K, T, E>>>>;
+pub type InitHooksVec<K, T> = Arc<Vec<Box<dyn InitHook<K, T>>>>;
 
 /// A TCP protocol based state server.
 /// TLS is mandatory and provided by rustls.
@@ -72,26 +73,24 @@ pub type HooksVec<K, T, E> = Arc<Vec<Box<dyn Hook<K, T, E>>>>;
 ///     Echo(String)
 /// }
 ///
-/// fn main() {
-///     let listner = TcpListener::bind("127.0.0.1:1234").unwrap();
+/// let listner = TcpListener::bind("127.0.0.1:1234").unwrap();
 ///
-///     // WARNING: DO NOT USE THESE, THEY ARE PART OF THE PUBLIC LIBRARY, THIS SHOULD NOT BE USED IN ANY CASE
-///     let (certs, private_key) = syncstate::test_data::load_certs_and_key().unwrap();
+/// // WARNING: DO NOT USE THESE, THEY ARE PART OF THE PUBLIC LIBRARY, THIS SHOULD NOT BE USED IN ANY CASE
+/// let (certs, private_key) = syncstate::test_data::load_certs_and_key().unwrap();
 ///
-///     // Build the server tls config
-///     let tls_config = rustls::ServerConfig::builder()
-///         .with_no_client_auth()
-///         .with_single_cert(certs, private_key)
-///         .unwrap();
+/// // Build the server tls config
+/// let tls_config = rustls::ServerConfig::builder()
+///     .with_no_client_auth()
+///     .with_single_cert(certs, private_key)
+///     .unwrap();
 ///
-///     let tls_config = Arc::new(tls_config);
-///     let password = b"HelloWorld".to_vec();
+/// let tls_config = Arc::new(tls_config);
+/// let password = b"HelloWorld".to_vec();
 ///     
-///     // Hooks can only be set once
-///     let hooks = Arc::new(Vec::new());
+/// // Hooks can only be set once
+/// let hooks = Arc::new(Vec::new());
 ///
-///     let state_server: TcpStateServer<String, String, EventType> = TcpStateServer::from_tcp_listner(listner, tls_config, hooks, password);
-/// }
+/// let state_server: TcpStateServer<String, String, EventType> = TcpStateServer::from_tcp_listner(listner, tls_config, hooks, password);
 /// ```
 pub struct TcpStateServer<K, T, E> {
     /// Hot swappable, you can change the socket whenever you'd like
@@ -99,6 +98,7 @@ pub struct TcpStateServer<K, T, E> {
 
     statemaps: HashMap<[u8; 32], Arc<Mutex<StateMap<K, T>>>>,
     hooks: HooksVec<K, T, E>,
+    init_hooks: InitHooksVec<K, T>,
     tls_config: Arc<rustls::ServerConfig>,
     buffer: Vec<u8>,
     password: Vec<u8>,
@@ -123,10 +123,17 @@ where
             serv: listner,
             statemaps: HashMap::new(),
             hooks,
-            tls_config: tls_config,
+            init_hooks: Arc::new(Vec::new()),
+            tls_config,
             buffer: Self::new_buffer(),
             password,
         }
+    }
+
+    /// By default no init hooks are present, use this function to set a vector of init hooks that will
+    /// be run on any initialization of new state maps that are created after calling this.
+    pub fn set_init_hooks(&mut self, init_hooks: InitHooksVec<K, T>) {
+        self.init_hooks = init_hooks;
     }
 
     /// Helper function to create a buffer
@@ -178,8 +185,8 @@ where
                 bincode::config::standard(),
             )?;
 
-            stream.write(&(resp_buffer.len() as u32).to_be_bytes())?;
-            stream.write(&resp_buffer)?;
+            let _ = stream.write(&(resp_buffer.len() as u32).to_be_bytes())?;
+            let _ = stream.write(&resp_buffer)?;
             drop(stream); // This line is redundant but added for the sake of it. We absolutely do not want to proceed when the verification fails
             return Ok(TcpStateServerResponse::IncorrectPassword);
         }
@@ -190,8 +197,8 @@ where
         let resp = self.process_request(req.event)?;
         let resp_buffer = bincode::serde::encode_to_vec(&resp, bincode::config::standard())?;
 
-        stream.write(&(resp_buffer.len() as u32).to_be_bytes())?;
-        stream.write(&resp_buffer)?;
+        let _ = stream.write(&(resp_buffer.len() as u32).to_be_bytes())?;
+        let _ = stream.write(&resp_buffer)?;
 
         Ok(resp)
     }
@@ -284,7 +291,21 @@ where
                     if stmap.hash().unwrap() != &hash {
                         Ok(TcpStateServerResponse::HashMismatch)
                     } else {
-                        self.statemaps.insert(hash, Arc::new(Mutex::new(stmap)));
+                        let stmap_arc = Arc::new(Mutex::new(stmap));
+
+                        // Run init hooks
+                        for hook in self.init_hooks.iter() {
+                            if let Err(e) = hook.process_init(stmap_arc.clone()) {
+                                error!("Init hook errored out: {e}");
+                                return Ok(TcpStateServerResponse::InitFailure {
+                                    error_message: e.to_string(),
+                                });
+                            }
+                        }
+
+                        // If all init hooks go successfully
+                        self.statemaps.insert(hash, stmap_arc.clone());
+
                         Ok(TcpStateServerResponse::InitSuccess)
                     }
                 }

@@ -97,7 +97,7 @@ impl<K: StateMapKey, T: StateMapValue> Diff<K, T> {
     }
 
     /// Consumes an iterator of Diffs and gives out a compressed Diff
-    pub fn merge<'a, I>(iterator: I) -> Diff<K, T>
+    pub fn merge<I>(iterator: I) -> Diff<K, T>
     where
         I: IntoIterator<Item = Diff<K, T>>,
     {
