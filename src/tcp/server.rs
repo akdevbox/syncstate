@@ -231,7 +231,7 @@ where
                     thread::spawn(move || {
                         let statemap_arc = statemap_arc;
 
-                        info!("Processing event: {:#?}", event);
+                        info!("Processing event: {:?}", event);
                         for x in hooks_arc.iter() {
                             if let Err(e) = x.process_event(&statemap_arc, &event) {
                                 error!("Error processing hook: {e}");

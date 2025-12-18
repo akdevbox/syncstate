@@ -113,7 +113,7 @@ impl<K: StateMapKey, T: StateMapValue> Remote<K, T> for TcpStateRemote {
         } else {
             // In the case the response was not a diff
             Err(Box::new(BasicError::Unknown(format!(
-                "Expected Diff as response, recieved: {:#?}",
+                "Expected Diff as response, recieved: {:?}",
                 resp
             ))))
         }
@@ -143,7 +143,7 @@ impl<K: StateMapKey, T: StateMapValue> Remote<K, T> for TcpStateRemote {
                 // Init succeeded
             } else {
                 return Err(Box::new(BasicError::Unknown(format!(
-                    "Initialization response is not success: {:#?}",
+                    "Initialization response is not success: {:?}",
                     init_resp
                 ))));
             }
@@ -168,7 +168,7 @@ impl EventBroadcaster for TcpStateRemote {
             Ok(())
         } else {
             Err(Box::new(BasicError::Unknown(format!(
-                "Unknown error: {:#?}",
+                "Unknown error: {:?}",
                 resp
             ))))
         }
