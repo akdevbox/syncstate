@@ -143,13 +143,8 @@
 //!     let mut state_server: tcp::TcpStateServer<MyMapKey, MyMapValue, MyEvent> = tcp::TcpStateServer::from_tcp_listner(listner, tls_config, hooks, password);
 //!     state_server.set_init_hooks(init_hooks);
 //!     
-//!     // Loop
-//!     loop {
-//!         match state_server.accept() {
-//!             Ok(response) => println!("Response sent: {response:#?}"),
-//!             Err(e) => eprintln!("Error encountered: {e}"),
-//!         }
-//!     }
+//!     // Start the server
+//!     state_server.start_server().expect("Unable to setup the server");
 //! }
 //!
 //! fn client() {

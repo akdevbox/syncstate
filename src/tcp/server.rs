@@ -1,10 +1,10 @@
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{self, Read, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
-    thread::{self, sleep},
+    thread::{self, JoinHandle, sleep},
     time::Duration,
 };
 use tracing::{error, info};
@@ -100,8 +100,8 @@ pub struct TcpStateServer<K, T, E> {
     hooks: HooksVec<K, T, E>,
     init_hooks: InitHooksVec<K, T>,
     tls_config: Arc<rustls::ServerConfig>,
-    buffer: Vec<u8>,
     password: Vec<u8>,
+    processed_hashes: HashSet<[u8; 32]>, // any hashes that are in between init phase are also added here
 }
 
 impl<K, T, E> TcpStateServer<K, T, E>
@@ -125,8 +125,8 @@ where
             hooks,
             init_hooks: Arc::new(Vec::new()),
             tls_config,
-            buffer: Self::new_buffer(),
             password,
+            processed_hashes: HashSet::new(),
         }
     }
 
@@ -141,12 +141,38 @@ where
         vec![0u8; 100_000]
     }
 
-    /// Accepts a connection on the [`TcpListener`], negotiates a TLS connection,
+    /// Takes an owned TcpStateServer and starts a multi threaded server on it, this function
+    /// keeps accepting requests and processes them in individual threads. if you want to do
+    /// custom behaviours and custom error handling, you can look at [`TcpStateServer::handle_stream`]
+    /// (it contains the logic to handle a `TcpStream` and returns a `std::thread::JoinHandle`)
+    pub fn start_server(self) -> Result<(), TcpStateServerError> {
+        let sock = self.serv.try_clone()?;
+        let server = Arc::new(Mutex::new(self));
+        loop {
+            let (stream, addr) = match sock.accept() {
+                Ok(v) => v,
+                Err(e) => {
+                    error!(
+                        "Error encountered when accepting a connection on socket: {sock:?}, error: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            info!("Accepted connection from {addr}");
+
+            Self::handle_stream(server.clone(), stream);
+        }
+    }
+
+    /// Handles an existing freshly accepted TcpStream and negotiates a TLS handshake on,
     /// and then finally streams the Event from the socket, after which all the Hooks
     /// are run.
     ///
-    /// Returns a `Result<bool, TcpStateServerError>`. the bool value tells if any
-    /// actual updates to the state map were done.
+    /// Returns a `JoinHandle<Result<TcpStateServerResponse, TcpStateServerError>>` which
+    /// is a handle on the thread spawned by this method. The handle might never return
+    /// if its a request to stream updates, so it is generally advised to use this handle
+    /// to kill ongoing requests rather than to check up on the response.
     ///
     /// This can accept a multitude of requests based on [`TcpStateServerRequestWrapper`].
     /// Writes back the response by first encoding the length using u32be and then
@@ -158,49 +184,62 @@ where
     /// * returns [`TcpStateServerError::EncodeError`] in cases where it is unable to serialize the response,
     ///   this case should never really happen so if it does, please report this as a bug.
     /// * any [`rustls::Error`] is returned as [`TcpStateServerError::RustlsError`]
-    pub fn accept(&mut self) -> Result<TcpStateServerResponse, TcpStateServerError> {
+    /// * if there are errors pertaining to `Mutex`, [`TcpStateServerError::MutexPoisonError`] is returned
+    pub fn handle_stream(
+        server: Arc<Mutex<Self>>,
+        stream: TcpStream,
+    ) -> JoinHandle<Result<TcpStateServerResponse, TcpStateServerError>> {
         // Form the stream and TLS wrapper around it
-        let (stream, addr) = self.serv.accept()?;
-        let mut stream = StreamOwned::new(ServerConnection::new(self.tls_config.clone())?, stream);
 
-        // We send and recieve data in a length-prefixed manner, get the length of
-        // te payload as a big-endian u32.
-        let mut len_buffer = [0u8; 4];
-        stream.read_exact(&mut len_buffer)?;
-        let len = u32::from_be_bytes(len_buffer) as usize;
+        thread::spawn(move || {
+            let server_lock = server.lock().map_err(to_mutex_poison_err)?;
 
-        // Resize the buffer for anticipated length and read into it
-        self.buffer.resize(len, 0);
-        stream.read_exact(&mut self.buffer)?;
+            let tls_config_arc = server_lock.tls_config.clone();
+            let server_password_clone = server_lock.password.clone();
 
-        let req: TcpStateServerRequestWrapper =
-            bincode::serde::decode_from_slice(&self.buffer, bincode::config::standard())?.0;
+            drop(server_lock); // Drop the lock after copying essential values.
 
-        // Password checking
-        if self.password != req.password {
-            sleep(Duration::from_micros(rand::random_range(100..100000)));
+            let mut stream = StreamOwned::new(ServerConnection::new(tls_config_arc)?, stream);
 
-            let resp_buffer = bincode::serde::encode_to_vec(
-                TcpStateServerResponse::IncorrectPassword,
-                bincode::config::standard(),
-            )?;
+            // We send and recieve data in a length-prefixed manner, get the length of
+            // te payload as a big-endian u32.
+            let mut len_buffer = [0u8; 4];
+            stream.read_exact(&mut len_buffer)?;
+            let len = u32::from_be_bytes(len_buffer) as usize;
+
+            // Resize the buffer for anticipated length and read into it
+            let mut buffer = Self::new_buffer();
+
+            buffer.resize(len, 0);
+            stream.read_exact(&mut buffer)?;
+
+            let req: TcpStateServerRequestWrapper =
+                bincode::serde::decode_from_slice(&buffer, bincode::config::standard())?.0;
+
+            // Password checking
+            if server_password_clone != req.password {
+                sleep(Duration::from_micros(rand::random_range(100..100000)));
+
+                let resp_buffer = bincode::serde::encode_to_vec(
+                    TcpStateServerResponse::IncorrectPassword,
+                    bincode::config::standard(),
+                )?;
+
+                let _ = stream.write(&(resp_buffer.len() as u32).to_be_bytes())?;
+                let _ = stream.write(&resp_buffer)?;
+                drop(stream); // This line is redundant but added for the sake of it. We absolutely do not want to proceed when the verification fails
+                return Ok(TcpStateServerResponse::IncorrectPassword);
+            }
+
+            // Process the request appropriately from this point forward
+            let resp = Self::process_request(server, req.event)?;
+            let resp_buffer = bincode::serde::encode_to_vec(&resp, bincode::config::standard())?;
 
             let _ = stream.write(&(resp_buffer.len() as u32).to_be_bytes())?;
             let _ = stream.write(&resp_buffer)?;
-            drop(stream); // This line is redundant but added for the sake of it. We absolutely do not want to proceed when the verification fails
-            return Ok(TcpStateServerResponse::IncorrectPassword);
-        }
 
-        info!("Accepted request from {}", addr);
-
-        // Process the request appropriately from this point forward
-        let resp = self.process_request(req.event)?;
-        let resp_buffer = bincode::serde::encode_to_vec(&resp, bincode::config::standard())?;
-
-        let _ = stream.write(&(resp_buffer.len() as u32).to_be_bytes())?;
-        let _ = stream.write(&resp_buffer)?;
-
-        Ok(resp)
+            Ok(resp)
+        })
     }
 
     /// Usually not called directly, this function processes a [`TcpStateServerRequest`] and returns appropriately to
@@ -208,12 +247,14 @@ where
     ///
     /// This function runs a match statement and processes all sorts of events that it can proces
     fn process_request(
-        &mut self,
+        server: Arc<Mutex<Self>>,
         request: TcpStateServerRequest,
     ) -> Result<TcpStateServerResponse, TcpStateServerError> {
+        let mut server_lock = server.lock().map_err(to_mutex_poison_err)?;
+
         match request {
             TcpStateServerRequest::GetUpdateId { hash } => {
-                if let Some(v) = self.statemaps.get(&hash) {
+                if let Some(v) = server_lock.statemaps.get(&hash) {
                     Ok(TcpStateServerResponse::UpdateId {
                         update_id: v.lock().map_err(to_mutex_poison_err)?.get_update_id(),
                     })
@@ -222,10 +263,10 @@ where
                 }
             }
             TcpStateServerRequest::Event { hash, evt_data } => {
-                if let Some(v) = self.statemaps.get(&hash) {
+                if let Some(v) = server_lock.statemaps.get(&hash) {
                     let event: Event<E> = Event::deserialize(&evt_data).map_err(to_unknown_err)?;
                     // This point forward we run the hooks in threads
-                    let hooks_arc = self.hooks.clone();
+                    let hooks_arc = server_lock.hooks.clone();
                     let statemap_arc = v.clone();
 
                     thread::spawn(move || {
@@ -249,7 +290,7 @@ where
                 from_update_id,
                 upto_update_id,
             } => {
-                if let Some(v) = self.statemaps.get(&hash) {
+                if let Some(v) = server_lock.statemaps.get(&hash) {
                     let diff = v
                         .lock()
                         .map_err(to_mutex_poison_err)?
@@ -269,12 +310,27 @@ where
                 }
             }
             TcpStateServerRequest::Init { hash, init_data } => {
-                if self.statemaps.contains_key(&hash) {
+                if server_lock.statemaps.contains_key(&hash) {
                     Ok(TcpStateServerResponse::InitSuccess)
                 } else {
+                    let init_hooks = server_lock.init_hooks.clone();
+                    if !server_lock.processed_hashes.insert(hash) {
+                        // Server already processed this hash
+                        return Ok(TcpStateServerResponse::InitSuccess);
+                    }
+
+                    drop(server_lock);
+
                     let mut stmap = StateMap::new(Arc::new(DummyRemote));
                     let raw_map: HashMap<K, T> =
-                        bincode::serde::decode_from_slice(&init_data, bincode::config::standard())?
+                        bincode::serde::decode_from_slice(&init_data, bincode::config::standard())
+                            .inspect_err(|_| {
+                                // This ugly looking function is simply to ensure that the server removes the specific hash from processed hashes
+                                // before erroring out.
+                                if let Ok(mut server_lock) = server.lock() {
+                                    server_lock.processed_hashes.remove(&hash);
+                                }
+                            })?
                             .0;
 
                     for (k, v) in raw_map {
@@ -286,7 +342,14 @@ where
                     stmap
                         .set_master(true)
                         .expect("state map should not yet be frozen when setting master to true");
-                    stmap.freeze()?;
+
+                    stmap.freeze().inspect_err(|_| {
+                        // This ugly looking function is simply to ensure that the server removes the specific hash from processed hashes
+                        // before erroring out.
+                        if let Ok(mut server_lock) = server.lock() {
+                            server_lock.processed_hashes.remove(&hash);
+                        }
+                    })?;
 
                     if stmap.hash().unwrap() != &hash {
                         Ok(TcpStateServerResponse::HashMismatch)
@@ -294,9 +357,15 @@ where
                         let stmap_arc = Arc::new(Mutex::new(stmap));
 
                         // Run init hooks
-                        for hook in self.init_hooks.iter() {
+                        for hook in init_hooks.iter() {
                             if let Err(e) = hook.process_init(stmap_arc.clone()) {
                                 error!("Init hook errored out: {e}");
+
+                                // Also ensure that the hash is removed from processing
+                                if let Ok(mut server_lock) = server.lock() {
+                                    server_lock.processed_hashes.remove(&hash);
+                                }
+
                                 return Ok(TcpStateServerResponse::InitFailure {
                                     error_message: e.to_string(),
                                 });
@@ -304,7 +373,9 @@ where
                         }
 
                         // If all init hooks go successfully
-                        self.statemaps.insert(hash, stmap_arc.clone());
+                        let mut server_lock = server.lock().map_err(to_mutex_poison_err)?;
+                        server_lock.statemaps.insert(hash, stmap_arc.clone());
+                        server_lock.processed_hashes.remove(&hash);
 
                         Ok(TcpStateServerResponse::InitSuccess)
                     }
